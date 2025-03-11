@@ -186,105 +186,89 @@ func TestBatcherInvalidConfig(t *testing.T) {
 	}
 }
 
-func TestBatcherPendingWorkCapacity(t *testing.T) {
-	// Create channels to control and track batch processing
-	releaseProcessing := make(chan struct{})
+func TestBatcherMaxPendingBlocking(t *testing.T) {
+	// Control channels to coordinate the test
+	flushStarted := make(chan bool, 1)
+	allowFlush := make(chan bool, 1)
+	addCompleted := make(chan bool, 1)
 
-	// Set up configuration with small MaxConcurrentBatches and PendingWorkCapacity
 	config := Config[int]{
-		MaxBatchSize:         5,
-		BatchTimeout:         50 * time.Millisecond,
-		MaxConcurrentBatches: 2, // Only allow 2 concurrent batches
-		PendingWorkCapacity:  3, // Very small capacity to test blocking
+		MaxBatchSize:         2,         // Small batch size
+		BatchTimeout:         time.Hour, // Long timeout to ensure batching by size only
+		MaxConcurrentBatches: 1,         // Single worker
+		PendingWorkCapacity:  1,         // Only one pending batch allowed
 		Flush: func(batch []int) {
-			t.Logf("Flushing batch: %v", batch)
-			<-releaseProcessing
-			t.Logf("Released batch: %v", batch)
+			// Signal that flush has started
+			flushStarted <- true
+			// Wait for test to allow flush to complete
+			<-allowFlush
 		},
 	}
 
 	b := New(config)
-
 	if err := b.Start(); err != nil {
 		t.Fatalf("Failed to start batcher: %v", err)
 	}
 
-	for i := 0; i < 15; i++ {
-		t.Logf("Added item %d", i) // These should be queued in the work channel
-		b.Add(i)
+	// Add first batch (2 items) - this will start processing
+	b.Add(1)
+	b.Add(2)
+
+	// Wait for first batch to start processing
+	select {
+	case <-flushStarted:
+		// Good - flush started
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("First batch did not start processing")
 	}
 
-	// Create a channel to signal if Add blocks
-	addBlocked := make(chan bool, 1)
+	// Add second batch (2 items) but not flush
+	b.Add(3)
+	b.Add(4)
 
-	// Try to add one more item, which should block because we've reached capacity
+	// Fill pending capacity
+	b.Add(5)
+
+	// After pending capacity is filled, add another item, check that it blocks
+	// Try to add another item in a goroutine - should block
 	go func() {
-		// Give a timeout to detect if Add blocks
-		timer := time.NewTimer(500 * time.Millisecond) // Longer timeout for more reliability
-		done := make(chan struct{})
-
-		go func() {
-			b.Add(999)
-			t.Log("Add(999) returned") // This should block because the channel is full
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			addBlocked <- false // Add didn't block
-		case <-timer.C:
-			addBlocked <- true // Add blocked as expected
-		}
+		b.Add(6)
+		addCompleted <- true // Signal we completed the add
 	}()
 
-	// Give some time for the goroutine to start and attempt to add
-	time.Sleep(100 * time.Millisecond)
+	// Verify the add is blocked
+	select {
+	case <-addCompleted:
+		t.Error("Add did not block when max pending was reached")
+	case <-time.After(100 * time.Millisecond):
 
-	// Check if Add blocked
-	blocked := <-addBlocked
-	if !blocked {
-		t.Error("Expected Add to block when PendingWorkCapacity is reached, but it didn't")
 	}
 
-	releaseProcessing <- struct{}{}
-	releaseProcessing <- struct{}{}
-	releaseProcessing <- struct{}{}
-	releaseProcessing <- struct{}{}
+	// Allow first batch to complete
+	allowFlush <- true
 
-	// Clean up
-	t.Log("Stopping batcher")
-	if err := b.Stop(); err != nil {
-		t.Fatalf("Failed to stop batcher: %v", err)
+	// Wait for first batch to complete and second batch to start
+	select {
+	case <-flushStarted:
+		// Good - second batch started
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Second batch did not start processing")
 	}
 
-	// Make sure all batches are processed
-	close(releaseProcessing)
-}
+	// Allow second batch to complete
+	allowFlush <- true
 
-func BenchmarkBatcher(b *testing.B) {
-	config := Config[int]{
-		MaxBatchSize:         100,
-		BatchTimeout:         50 * time.Millisecond,
-		MaxConcurrentBatches: 4,
-		PendingWorkCapacity:  1000,
-		Flush: func(batch []int) {
-		},
+	// Wait for blocked Add to complete
+	select {
+	case <-addCompleted:
+		// Good - Add completed after batch was processed
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Add remained blocked after batch was processed")
 	}
 
-	batcher := New(config)
-	if err := batcher.Start(); err != nil {
-		b.Fatalf("Failed to start batcher: %v", err)
-	}
+	// Allow final batch to complete
+	allowFlush <- true
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		batcher.Add(i)
-	}
-
-	b.StopTimer()
-
-	if err := batcher.Stop(); err != nil {
-		b.Fatalf("Failed to stop batcher: %v", err)
-	}
+	// Clean shutdown
+	b.Stop()
 }

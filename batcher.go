@@ -2,7 +2,6 @@ package batcher
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -72,7 +71,6 @@ func (c *Batcher[T]) worker() {
 	var batchTimeout <-chan time.Time
 	send := func() {
 		c.workGroup.Add(1)
-		fmt.Println("Sending batch")
 		go func(batch []T) {
 			defer c.workGroup.Done()
 			c.Flush(batch)

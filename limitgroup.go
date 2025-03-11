@@ -6,11 +6,14 @@ import (
 
 var sentinel = struct{}{}
 
+// LimitGroup provides a WaitGroup with a limited upper bound. Once the limit
+// is hit, Add will block until sufficient deltas are returned.
 type LimitGroup struct {
 	sync.WaitGroup
 	slots chan struct{}
 }
 
+// NewLimitGroup creates a new LimitGroup with the configured limit.
 func NewLimitGroup(limit uint) *LimitGroup {
 	if limit == 0 {
 		panic("zero is not a valid limit")
@@ -19,6 +22,8 @@ func NewLimitGroup(limit uint) *LimitGroup {
 	return &LimitGroup{slots: slots}
 }
 
+// Add adds delta, which may be negative. It will block if we have hit the
+// limit, and will unblock as Done is called.
 func (l *LimitGroup) Add(delta int) {
 	if delta > cap(l.slots) {
 		panic("delta greater than limit")
@@ -27,6 +32,8 @@ func (l *LimitGroup) Add(delta int) {
 		return
 	}
 
+	// If we're adding, we need to accquire slots, if we're subtracting, we need
+	// to return slots.
 	if delta > 0 {
 		l.WaitGroup.Add(delta)
 		for i := 0; i < delta; i++ {
@@ -44,6 +51,7 @@ func (l *LimitGroup) Add(delta int) {
 	}
 }
 
+// Done decrements the counter.
 func (l *LimitGroup) Done() {
 	select {
 	case <-l.slots:
